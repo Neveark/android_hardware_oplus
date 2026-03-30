@@ -13,6 +13,7 @@ cc_defaults {
     shared_libs: [
         "libbase",
         "libbinder_ndk",
+        "liblog",
     ],
     device_specific: true,
 }
