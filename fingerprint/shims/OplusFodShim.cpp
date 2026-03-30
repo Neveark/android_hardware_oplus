@@ -15,7 +15,6 @@
 #include <android-base/properties.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <poll.h>
 #include <pthread.h>
 #include <dlfcn.h>
 #include <string.h>
@@ -27,23 +26,19 @@ using android::base::GetProperty;
 namespace {
 
 static const char* kFodNode = "/sys/kernel/oplus_display/notify_fppress";
-static const char* kFpStateNode = "/sys/kernel/oplus_display/fp_state";
 static const char kSessionDesc[] = "android.hardware.biometrics.fingerprint.ISession";
 
 /*
  * OPlus fingerprint HAL vendor-specific onAcquired codes.
  * The HAL sends these via ISessionCallback::onAcquired to signal finger
- * down/up, even under AOD where the kernel's fp_state doesn't fire.
+ * down/up, even under AOD where the framework's onPointerDown doesn't fire.
  */
 static constexpr int32_t kVendorFingerDown = 22;
 static constexpr int32_t kVendorFingerUp = 23;
 
-static bool gMonitorRunning = false;
-static pthread_t gMonitorThread;
 static bool gPressed = false;
 static int gFodFd = -1;
 static pthread_mutex_t gMutex = PTHREAD_MUTEX_INITIALIZER;
-static bool gSessionEndReset = false;  // tells monitor to reset lastState
 
 static AIBinder_Class_onTransact gOrigSessionOnTransact = nullptr;
 
@@ -80,97 +75,7 @@ static void setPressed(bool pressed) {
     }
 }
 
-/*
- * Turn off HBM and tell the monitor thread to reset lastState to 0,
- * so the next fp_state=1 is treated as a fresh finger-down.
- */
-static void notifySessionEnd() {
-    setPressed(false);
-    pthread_mutex_lock(&gMutex);
-    gSessionEndReset = true;
-    pthread_mutex_unlock(&gMutex);
-}
-
-static bool readFpState(int fd, int& x, int& y, int& state) {
-    char buffer[128];
-    if (lseek(fd, 0, SEEK_SET) < 0) return false;
-    ssize_t len = read(fd, buffer, sizeof(buffer) - 1);
-    if (len <= 0) return false;
-    buffer[len] = '\0';
-    return sscanf(buffer, "%d,%d,%d", &x, &y, &state) == 3;
-}
-
-/*
- * Monitor thread: watches fp_state via poll() for instant wakeup.
- * Handles the lockscreen / light-AOD case where the touch driver DOES
- * report finger events.  Deep AOD is handled by the vendor code path.
- */
-static void* monitorThread(void* /*arg*/) {
-    int fd = open(kFpStateNode, O_RDONLY);
-    if (fd < 0) return nullptr;
-
-    int lastState = 0, x, y, state;
-    readFpState(fd, x, y, state);
-    lastState = state;
-
-    struct pollfd pfd = { .fd = fd, .events = POLLPRI | POLLERR, .revents = 0 };
-
-    while (gMonitorRunning) {
-        int ret = poll(&pfd, 1, 200);
-        if (!readFpState(fd, x, y, state)) continue;
-
-        /*
-         * After a session ends (auth success/error/close), fp_state may
-         * stay at 1 because the sensor is stopped before the finger lifts.
-         * Reset lastState so the next real fp_state=1 is detected.
-         */
-        pthread_mutex_lock(&gMutex);
-        if (gSessionEndReset) {
-            gSessionEndReset = false;
-            ALOGI("monitor: session-end reset (lastState %d -> 0)", lastState);
-            lastState = 0;
-        }
-        pthread_mutex_unlock(&gMutex);
-
-        if (ret > 0 && state != lastState) {
-            ALOGI("fp_state: %d,%d,%d (was %d)", x, y, state, lastState);
-            setPressed(state > 0);
-            lastState = state;
-        }
-    }
-
-    close(fd);
-    return nullptr;
-}
-
-static void startMonitor() {
-    if (gMonitorRunning) return;
-
-    std::string sensorType = GetProperty("persist.vendor.fingerprint.sensor_type", "");
-    ALOGI("init: sensor_type=%s", sensorType.c_str());
-
-    if (sensorType != "optical") {
-        ALOGI("init: not optical sensor, monitor disabled");
-        return;
-    }
-    if (access(kFpStateNode, R_OK) != 0) {
-        ALOGE("init: %s not readable — fp_state monitor disabled", kFpStateNode);
-        return;
-    }
-
-    gFodFd = open(kFodNode, O_WRONLY | O_CLOEXEC);
-    ALOGI("init: fp_state readable, notify_fppress fd=%d", gFodFd);
-
-    gMonitorRunning = true;
-
-    if (pthread_create(&gMonitorThread, nullptr, monitorThread, nullptr) == 0) {
-        pthread_setname_np(gMonitorThread, "FodMonitor");
-    } else {
-        gMonitorRunning = false;
-    }
-}
-
-/* ISession incoming-call wrapper (if AIBinder_Class_define hook fires) */
+/* ISession incoming-call wrapper — catches framework onPointerDown/Up */
 static binder_status_t sessionOnTransactWrapper(AIBinder* binder, transaction_code_t code,
                                                 const AParcel* in, AParcel* out) {
     if (code == ISession::TRANSACTION_onPointerDownWithContext) {
@@ -219,9 +124,9 @@ binder_status_t AParcel_writeInt32(AParcel* parcel, int32_t value) {
 /*
  * Hook: outgoing binder calls (HAL -> framework callbacks).
  *
- * Key insight: the OPlus HAL sends onAcquired with vendor codes 22 (finger
- * down / need HBM) and 23 (finger up / HBM off).  This fires even under
- * deep AOD, where the kernel's fp_state doesn't report finger-down events.
+ * Catches vendor-specific onAcquired codes 22 (finger down) and 23 (finger up)
+ * for deep AOD where the framework's onPointerDown doesn't fire.
+ * Also catches session-end events to ensure HBM is always turned off.
  */
 extern "C"
 binder_status_t AIBinder_transact(AIBinder* binder, transaction_code_t code,
@@ -247,12 +152,12 @@ binder_status_t AIBinder_transact(AIBinder* binder, transaction_code_t code,
         }
     }
 
-    /* Session-end events: ensure HBM is off and reset monitor state */
+    /* Session-end events: ensure HBM is off */
     if (code == ISessionCallback::TRANSACTION_onAuthenticationSucceeded ||
         code == ISessionCallback::TRANSACTION_onError ||
         code == ISessionCallback::TRANSACTION_onSessionClosed) {
-        ALOGI("session end (code=%d) -> HBM off + reset", code);
-        notifySessionEnd();
+        ALOGI("session end (code=%d) -> HBM off", code);
+        setPressed(false);
     }
 
     binder_status_t ret = orig(binder, code, in, out, flags);
@@ -263,8 +168,8 @@ binder_status_t AIBinder_transact(AIBinder* binder, transaction_code_t code,
 }
 
 /*
- * Hook: binder class registration — wrap ISession to see incoming calls.
- * May not fire on all devices (HIDL HALs), but harmless if it doesn't.
+ * Hook: binder class registration — wrap ISession to see incoming
+ * onPointerDown/onPointerUp calls from the framework.
  */
 extern "C"
 AIBinder_Class* AIBinder_Class_define(const char* interfaceDescriptor,
@@ -275,10 +180,6 @@ AIBinder_Class* AIBinder_Class_define(const char* interfaceDescriptor,
                                    AIBinder_Class_onDestroy, AIBinder_Class_onTransact);
     static auto orig = (Fn)dlsym(RTLD_NEXT, "AIBinder_Class_define");
     if (!orig) return nullptr;
-
-    if (interfaceDescriptor) {
-        ALOGI("AIBinder_Class_define: %s", interfaceDescriptor);
-    }
 
     if (interfaceDescriptor &&
         strncmp(interfaceDescriptor, kSessionDesc, sizeof(kSessionDesc) - 1) == 0 &&
@@ -294,15 +195,22 @@ AIBinder_Class* AIBinder_Class_define(const char* interfaceDescriptor,
 
 __attribute__((constructor))
 static void init() {
-    startMonitor();
+    /* Temporarily disabled: testing DRM connector property path for LHBM */
+    ALOGI("init: OplusFodShim disabled for DRM property path testing");
+    return;
+
+    std::string sensorType = GetProperty("persist.vendor.fingerprint.sensor_type", "");
+    if (sensorType != "optical") {
+        ALOGI("init: not optical sensor (%s), disabled", sensorType.c_str());
+        return;
+    }
+
+    gFodFd = open(kFodNode, O_WRONLY | O_CLOEXEC);
+    ALOGI("init: notify_fppress fd=%d", gFodFd);
 }
 
 __attribute__((destructor))
 static void cleanup() {
-    if (gMonitorRunning) {
-        gMonitorRunning = false;
-        pthread_join(gMonitorThread, nullptr);
-    }
     setPressed(false);
     if (gFodFd >= 0) {
         close(gFodFd);
